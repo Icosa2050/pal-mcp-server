@@ -38,3 +38,58 @@ def test_first_response_persisted_in_conversation_history(tmp_path):
 
     # Cleanup storage for subsequent tests
     storage._store.clear()  # type: ignore[attr-defined]
+
+
+async def _chat(tmp_path, prompt, continuation_id=None):
+    import json
+
+    from server import handle_call_tool
+
+    arguments = {
+        "prompt": prompt,
+        "model": "gemini-2.5-flash",
+        "working_directory_absolute_path": str(tmp_path),
+    }
+    if continuation_id:
+        arguments["continuation_id"] = continuation_id
+    result = await handle_call_tool("chat", arguments)
+    return json.loads(result[0].text)["continuation_offer"]
+
+
+def test_chat_continuation_sends_and_stores_each_turn_once(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from providers.gemini import GeminiModelProvider
+
+    prompts = []
+    questions = ["continuation-marker-alpha", "continuation-marker-beta", "continuation-marker-gamma"]
+
+    def generate_content(self, *, prompt, **kwargs):
+        prompts.append(prompt)
+        return SimpleNamespace(content=f"assistant-answer-{len(prompts)}", metadata={}, usage={})
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(GeminiModelProvider, "generate_content", generate_content)
+
+    async def exercise():
+        first = await _chat(tmp_path, questions[0])
+        thread_id = first["continuation_id"]
+        second = await _chat(tmp_path, questions[1], thread_id)
+        third = await _chat(tmp_path, questions[2], thread_id)
+
+        assert [[prompt.count(question) for question in questions] for prompt in prompts] == [
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 1, 1],
+        ]
+        assert prompts[1].count("assistant-answer-1") == 1
+        assert prompts[2].count("assistant-answer-1") == 1
+        assert prompts[2].count("assistant-answer-2") == 1
+        thread = get_thread(thread_id)
+        assert [turn.role for turn in thread.turns] == ["user", "assistant"] * 3
+        assert [turn.content for turn in thread.turns if turn.role == "user"] == questions
+        assert first["remaining_turns"] - second["remaining_turns"] == 2
+        assert second["remaining_turns"] - third["remaining_turns"] == 2
+
+    asyncio.run(exercise())
