@@ -330,11 +330,9 @@ class SimpleTool(BaseTool):
 
             # Handle conversation history and prompt preparation
             if continuation_id:
-                # Check if conversation history is already embedded
-                field_value = self.get_request_prompt(request)
-                if "=== CONVERSATION HISTORY ===" in field_value:
-                    # Use pre-embedded history
-                    prompt = field_value
+                if "_original_user_prompt" in arguments:
+                    # The server already recorded the user turn and built the prompt.
+                    prompt = self.get_request_prompt(request)
                     logger.debug(f"{self.get_name()}: Using pre-embedded conversation history")
                 else:
                     # No embedded history - reconstruct it (for in-process calls)
@@ -346,22 +344,11 @@ class SimpleTool(BaseTool):
                     thread_context = get_thread(continuation_id)
 
                     if thread_context:
-                        # Add user's new input to conversation
+                        conversation_history, _ = build_conversation_history(thread_context, self._model_context)
+
                         user_prompt = self.get_request_prompt(request)
-                        user_files = self.get_request_files(request)
                         if user_prompt:
-                            add_turn(continuation_id, "user", user_prompt, files=user_files)
-
-                            # Get updated thread context after adding the turn
-                            thread_context = get_thread(continuation_id)
-                            logger.debug(
-                                f"{self.get_name()}: Retrieved updated thread with {len(thread_context.turns)} turns"
-                            )
-
-                        # Build conversation history with updated thread context
-                        conversation_history, conversation_tokens = build_conversation_history(
-                            thread_context, self._model_context
-                        )
+                            add_turn(continuation_id, "user", user_prompt, files=self.get_request_files(request))
 
                         # Get the base prompt from the tool
                         base_prompt = await self.prepare_prompt(request)
@@ -651,11 +638,11 @@ class SimpleTool(BaseTool):
                     if turn_count >= MAX_CONVERSATION_TURNS - 1:
                         return None  # No more turns allowed
 
-                    remaining_turns = MAX_CONVERSATION_TURNS - turn_count - 1
+                    remaining_turns = MAX_CONVERSATION_TURNS - turn_count
                     return {
                         "continuation_id": continuation_id,
                         "remaining_turns": remaining_turns,
-                        "note": f"You can continue this conversation for {remaining_turns} more exchanges.",
+                        "note": f"You can continue this conversation for {remaining_turns // 2} more exchanges.",
                     }
             else:
                 # New conversation - create thread and offer continuation
@@ -676,10 +663,12 @@ class SimpleTool(BaseTool):
                     new_thread_id, "user", user_prompt, files=user_files, images=user_images, tool_name=self.get_name()
                 )
 
+                # The response builder will record the initial assistant turn.
+                remaining_turns = MAX_CONVERSATION_TURNS - 2
                 return {
                     "continuation_id": new_thread_id,
-                    "remaining_turns": MAX_CONVERSATION_TURNS - 1,
-                    "note": f"You can continue this conversation for {MAX_CONVERSATION_TURNS - 1} more exchanges.",
+                    "remaining_turns": remaining_turns,
+                    "note": f"You can continue this conversation for {remaining_turns // 2} more exchanges.",
                 }
         except Exception:
             return None

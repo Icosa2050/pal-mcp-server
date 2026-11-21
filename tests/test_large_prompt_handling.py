@@ -620,7 +620,7 @@ class TestLargePromptHandling:
 
         # Mock huge conversation history (simulates many turns of conversation)
         # Calculate repetitions needed to exceed MCP_PROMPT_SIZE_LIMIT
-        base_text = "=== CONVERSATION HISTORY ===\n"
+        base_text = "=== CONVERSATION HISTORY (CONTINUATION) ===\n"
         repeat_text = "Previous message content\n"
         # Add buffer to ensure we exceed the limit
         target_size = MCP_PROMPT_SIZE_LIMIT + 1000
@@ -663,32 +663,11 @@ class TestLargePromptHandling:
             # This mimics what server.py does when it embeds conversation history
             request_with_history = {
                 "prompt": f"{huge_conversation_history}\n\n=== CURRENT REQUEST ===\n{small_continuation_prompt}",
+                "_original_user_prompt": small_continuation_prompt,
                 "model": "flash",
                 "continuation_id": "test_thread_123",
                 "working_directory_absolute_path": temp_dir,
             }
-
-            # Mock the conversation history embedding to simulate server.py behavior
-            original_execute = tool.__class__.execute
-
-            async def mock_execute_with_history(self, arguments):
-                # Check if this has continuation_id (simulating server.py logic)
-                if arguments.get("continuation_id"):
-                    # Simulate the case where conversation history is already embedded in prompt
-                    # by server.py before calling the tool
-                    field_value = arguments.get("prompt", "")
-                    if "=== CONVERSATION HISTORY ===" in field_value:
-                        # Set the flag that history is embedded
-                        self._has_embedded_history = True
-
-                        # The prompt field contains both history AND user input
-                        # But we should only check the user input part for MCP boundary
-                        # (This is what our fix ensures happens in prepare_prompt)
-
-                # Call original execute
-                return await original_execute(self, arguments)
-
-            tool.__class__.execute = mock_execute_with_history
 
             try:
                 # This should succeed because:
@@ -713,8 +692,6 @@ class TestLargePromptHandling:
                 assert len(final_prompt) > MCP_PROMPT_SIZE_LIMIT
 
             finally:
-                # Restore original execute method
-                tool.__class__.execute = original_execute
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
 

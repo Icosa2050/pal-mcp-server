@@ -1072,26 +1072,6 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
             f"This will create a new conversation thread that can continue with follow-up exchanges."
         )
 
-    # Add user's new input to the conversation
-    user_prompt = arguments.get("prompt", "")
-    if user_prompt:
-        # Capture files referenced in this turn
-        user_files = arguments.get("absolute_file_paths") or []
-        logger.debug(f"[CONVERSATION_DEBUG] Adding user turn to thread {continuation_id}")
-        from utils.token_utils import estimate_tokens
-
-        user_prompt_tokens = estimate_tokens(user_prompt)
-        logger.debug(
-            f"[CONVERSATION_DEBUG] User prompt length: {len(user_prompt)} chars (~{user_prompt_tokens:,} tokens)"
-        )
-        logger.debug(f"[CONVERSATION_DEBUG] User files: {user_files}")
-        success = add_turn(continuation_id, "user", user_prompt, files=user_files)
-        if not success:
-            logger.warning(f"Failed to add user turn to thread {continuation_id}")
-            logger.debug("[CONVERSATION_DEBUG] Failed to add user turn - thread may be at turn limit or expired")
-        else:
-            logger.debug(f"[CONVERSATION_DEBUG] Successfully added user turn to thread {continuation_id}")
-
     # Create model context early to use for history building
     from utils.model_context import ModelContext
 
@@ -1211,6 +1191,26 @@ async def reconstruct_thread_context(arguments: dict[str, Any]) -> dict[str, Any
     logger.debug(
         f"[CONVERSATION_DEBUG] Conversation history length: {len(conversation_history)} chars (~{conversation_tokens:,} tokens)"
     )
+
+    # Add user's new input to the conversation
+    user_prompt = arguments.get("prompt", "")
+    if user_prompt:
+        # Capture files referenced in this turn
+        user_files = arguments.get("absolute_file_paths") or []
+        logger.debug(f"[CONVERSATION_DEBUG] Adding user turn to thread {continuation_id}")
+        from utils.token_utils import estimate_tokens
+
+        user_prompt_tokens = estimate_tokens(user_prompt)
+        logger.debug(
+            f"[CONVERSATION_DEBUG] User prompt length: {len(user_prompt)} chars (~{user_prompt_tokens:,} tokens)"
+        )
+        logger.debug(f"[CONVERSATION_DEBUG] User files: {user_files}")
+        success = add_turn(continuation_id, "user", user_prompt, files=user_files)
+        if not success:
+            logger.warning(f"Failed to add user turn to thread {continuation_id}")
+            logger.debug("[CONVERSATION_DEBUG] Failed to add user turn - thread may be at turn limit or expired")
+        else:
+            logger.debug(f"[CONVERSATION_DEBUG] Successfully added user turn to thread {continuation_id}")
 
     # Add dynamic follow-up instructions based on turn count
     follow_up_instructions = get_follow_up_instructions(len(context.turns))
