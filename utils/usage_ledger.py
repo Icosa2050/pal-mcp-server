@@ -7,7 +7,13 @@ file::
 
 One writer per file means concurrent PAL processes never interleave or need
 locking; readers (e.g. Agent Orchestrator) scan the month directories
-statelessly and never write.
+statelessly and never write. Readers should treat any ``*.jsonl`` in a month
+dir as a ledger file: after a torn write the process continues in
+``...-r<N>.jsonl``.
+
+One line is written per billed HTTP attempt. A retried call that OpenRouter
+billed more than once yields several lines with distinct ``generation_id``s;
+readers de-duplicate by ``(key_id, generation_id)``.
 
 Privacy and safety rules:
 
@@ -217,10 +223,32 @@ class UsageLedger:
         self._host = _safe_host()
         self._pruned: set[tuple[str, str]] = set()  # (base dir, month) already pruned
         self._warned = False
+        self._file_seq = 0
 
     def _file_name(self) -> str:
         # pid is read at write time so a forked child never shares its parent's file.
-        return f"{self._host}-{os.getpid()}-{self._process_start}.jsonl"
+        # A non-zero sequence means an earlier file was retired after a torn write.
+        suffix = f"-r{self._file_seq}" if self._file_seq else ""
+        return f"{self._host}-{os.getpid()}-{self._process_start}{suffix}.jsonl"
+
+    def _write_all(self, fd: int, line: bytes) -> None:
+        """Write one complete line (single writer per file, caller holds the lock).
+
+        If the line cannot be completed after some bytes were written, the file
+        is retired so later records never get glued onto the torn line; readers
+        skip the torn line as malformed/partial.
+        """
+        written = 0
+        try:
+            while written < len(line):
+                count = os.write(fd, line[written:])
+                if count <= 0:
+                    raise OSError("usage ledger short write")
+                written += count
+        except BaseException:
+            if written:
+                self._file_seq += 1
+            raise
 
     def _warn_once(self, exc: BaseException) -> None:
         if not self._warned:
@@ -269,22 +297,27 @@ class UsageLedger:
             )
             with self._lock:
                 month_dir = base / month
-                if not base.exists():
-                    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+                base.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if month_dir.is_symlink():
+                    raise OSError("usage ledger month dir must not be a symlink")
                 month_dir.mkdir(mode=0o700, exist_ok=True)
+                # mkdir's mode is ignored for existing dirs (and masked by umask):
+                # enforce private permissions on the dirs we write into.
+                os.chmod(month_dir, 0o700)
                 prune_key = (str(base), month)
                 if prune_key not in self._pruned:
                     self._pruned.add(prune_key)
+                    os.chmod(base, 0o700)
                     try:
                         self.prune(base, now)
                     except Exception as exc:  # pruning must never block writing
                         logger.debug("PAL usage ledger prune skipped: %s", type(exc).__name__)
                 path = month_dir / self._file_name()
-                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(path, flags, 0o600)
                 try:
-                    # One write() call per line with O_APPEND: readers see whole
-                    # lines (or a partial trailing line they skip), never interleaving.
-                    os.write(fd, line)
+                    os.fchmod(fd, 0o600)  # also tighten a pre-existing file
+                    self._write_all(fd, line)
                 finally:
                     os.close(fd)
             return path
@@ -315,7 +348,7 @@ class UsageLedger:
                 "generation_id": _clip(generation_id) or None,
                 "key_id": key_id_for(api_key),
                 "model": _clip(model),
-                "served_model": _clip(served_model) if served_model and served_model != model else None,
+                "served_model": served if (served := _clip(served_model)) and served != _clip(model) else None,
                 "tool": _clip(_current_tool.get()),
                 "client": _current_client.get() or "unknown",
                 "ao_session_id": _clip(os.environ.get("AO_SESSION_ID") or None),

@@ -744,6 +744,32 @@ class OpenAICompatibleProvider(ModelProvider):
 
         return usage
 
+    @staticmethod
+    def _billed_error_envelope(error: BaseException) -> Optional[dict]:
+        """Return the error JSON envelope if it reports usage (the call was billed).
+
+        The OpenAI SDK replaces ``APIStatusError.body`` with the nested
+        ``error`` object, dropping sibling ``usage``/``id`` fields, so prefer
+        the raw HTTP response JSON and fall back to ``body``. Only ``usage`` and
+        ``id`` are ever read from it; error messages are never logged.
+        """
+        candidates = []
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                candidates.append(response.json())
+            except Exception:
+                pass
+        candidates.append(getattr(error, "body", None))
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                if isinstance(candidate.get("usage"), dict):
+                    return candidate
+                nested = candidate.get("error")
+                if isinstance(nested, dict) and isinstance(nested.get("usage"), dict):
+                    return nested
+        return None
+
     def _record_usage_ledger(
         self,
         *,
@@ -777,10 +803,10 @@ class OpenAICompatibleProvider(ModelProvider):
                     status="ok",
                 )
             elif error is not None:
-                body = getattr(error, "body", None)
-                usage = body.get("usage") if isinstance(body, dict) else None
-                if not isinstance(usage, dict):
+                body = self._billed_error_envelope(error)
+                if body is None:
                     return
+                usage = body["usage"]
                 get_ledger().record_call(
                     api_key=self.api_key,
                     model=model_name,

@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from openai import APIStatusError
 from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
 
@@ -105,6 +104,38 @@ def provider(monkeypatch):
     client = MagicMock()
     monkeypatch.setattr(OpenRouterProvider, "client", property(lambda self: client))
     return p, client
+
+
+@pytest.fixture
+def sdk_provider(monkeypatch):
+    """OpenRouterProvider backed by a real OpenAI SDK client over a mock HTTP transport."""
+    import importlib
+
+    from openai import OpenAI
+
+    client_mod = importlib.import_module("openai._client")
+    httpx_mod = getattr(client_mod, "httpx2", None) or client_mod.httpx
+
+    def factory(handler):
+        requests = []
+
+        def transport(request):
+            requests.append(request)
+            status, payload = handler(request)
+            return httpx_mod.Response(status, json=payload)
+
+        sdk = OpenAI(
+            api_key=SECRET_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            max_retries=0,
+            http_client=httpx_mod.Client(transport=httpx_mod.MockTransport(transport)),
+        )
+        monkeypatch.delenv("OPENROUTER_ALLOWED_MODELS", raising=False)
+        p = OpenRouterProvider(SECRET_KEY)
+        monkeypatch.setattr(OpenRouterProvider, "client", property(lambda self: sdk))
+        return p, requests
+
+    return factory
 
 
 # ---------------------------------------------------------------------------
@@ -255,20 +286,65 @@ class TestLedgerFromProvider:
         assert lines[0]["tool"] is None
         assert lines[0]["client"] == "unknown"
 
-    def test_billed_error_response_is_logged(self, ledger_dir, provider):
-        p, client = provider
-        request = MagicMock()
-        response = MagicMock(status_code=400, headers={}, request=request)
-        body = {"id": "gen-err-1", "error": {"message": SECRET_PROMPT}, "usage": {"prompt_tokens": 10, "cost": 0.001}}
-        client.chat.completions.create.side_effect = APIStatusError("bad", response=response, body=body)
+    def test_billed_error_response_is_logged(self, ledger_dir, sdk_provider):
+        # Goes through the real SDK: it rewrites APIStatusError.body to the nested
+        # "error" object, so usage/id must come from the raw response envelope.
+        body = {
+            "id": "gen-err-1",
+            "error": {"code": 400, "message": SECRET_PROMPT},
+            "usage": {"prompt_tokens": 10, "cost": 0.001},
+        }
+        p, _ = sdk_provider(lambda request: (400, body))
         with pytest.raises(RuntimeError):
             p.generate_content("hi", "openai/gpt-5")
         _, lines = read_lines(ledger_dir)
         assert len(lines) == 1  # 400 is not retried
         assert lines[0]["status"] == "error"
         assert lines[0]["cost_usd"] == 0.001
+        assert lines[0]["prompt_tokens"] == 10
         assert lines[0]["generation_id"] == "gen-err-1"
         assert SECRET_PROMPT not in json.dumps(lines)
+
+    def test_success_through_sdk_transport(self, ledger_dir, sdk_provider):
+        p, requests = sdk_provider(lambda request: (200, openrouter_chat_payload()))
+        assert p.generate_content(SECRET_PROMPT, "openai/gpt-5").content == SECRET_REPLY
+        _, lines = read_lines(ledger_dir)
+        assert lines[0]["cost_usd"] == 0.0123 and lines[0]["cached_tokens"] == 800
+        sent = json.loads(requests[0].content)
+        assert "usage" not in sent  # request parameters unchanged by the ledger
+
+    def test_each_billed_retry_attempt_is_its_own_row(self, ledger_dir, sdk_provider, monkeypatch):
+        import providers.base
+
+        monkeypatch.setattr(providers.base.time, "sleep", lambda _s: None)
+        responses = [
+            (500, {"id": "gen-try-1", "error": {"code": 500, "message": "upstream"}, "usage": {"cost": 0.002}}),
+            (200, openrouter_chat_payload()),
+        ]
+        p, _ = sdk_provider(lambda request: responses.pop(0))
+        assert p.generate_content("hi", "openai/gpt-5").content == SECRET_REPLY
+        _, lines = read_lines(ledger_dir)
+        # Both attempts were billed by OpenRouter as separate generations.
+        assert [(row["status"], row["generation_id"]) for row in lines] == [
+            ("error", "gen-try-1"),
+            ("ok", "gen-1764000000-AbCdEf"),
+        ]
+
+    def test_responses_endpoint_is_logged(self, ledger_dir, provider):
+        p, client = provider
+        client.responses.create.return_value = Response.model_construct(
+            id="gen-resp-9",
+            model="openai/o3-pro",
+            output_text=SECRET_REPLY,
+            output=[],
+            usage={"input_tokens": 50, "output_tokens": 20, "total_tokens": 70, "cost": 0.5},
+        )
+        result = p._generate_with_responses_endpoint("openai/o3-pro", [{"role": "user", "content": "x"}], 1.0)
+        assert result.usage["input_tokens"] == 50  # previously 0 for the Responses shape
+        assert result.usage["cost_usd"] == 0.5
+        _, lines = read_lines(ledger_dir)
+        assert lines[0]["generation_id"] == "gen-resp-9"
+        assert (lines[0]["prompt_tokens"], lines[0]["cost_usd"]) == (50, 0.5)
 
     def test_unbilled_error_is_not_logged(self, ledger_dir, provider):
         p, client = provider
@@ -350,6 +426,62 @@ class TestLedgerWriter:
             t.join()
         files, lines = read_lines(ledger_dir)  # json.loads would fail on a torn line
         assert len(files) == 1 and len(lines) == 800
+
+    def test_short_writes_are_completed(self, ledger_dir, monkeypatch):
+        real_write = os.write
+        monkeypatch.setattr(usage_ledger.os, "write", lambda fd, data: real_write(fd, data[:7]))
+        led = UsageLedger()
+        for i in range(3):
+            led.record_call(api_key="k", model="m", ts_start=0, ts_end=1e9, usage={}, generation_id=f"g{i}")
+        _, lines = read_lines(ledger_dir)
+        assert [row["generation_id"] for row in lines] == ["g0", "g1", "g2"]
+
+    def test_torn_write_retires_file(self, ledger_dir, monkeypatch):
+        real_write = os.write
+        calls = {"n": 0}
+
+        def flaky(fd, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd, data[:5])
+            if calls["n"] == 2:
+                raise OSError("disk full")
+            return real_write(fd, data)
+
+        monkeypatch.setattr(usage_ledger.os, "write", flaky)
+        led = UsageLedger()
+        assert led.record_call(api_key="k", model="m", ts_start=0, ts_end=1e9, usage={}, generation_id="a") is None
+        good = led.record_call(api_key="k", model="m", ts_start=0, ts_end=1e9, usage={}, generation_id="b")
+        assert good.name.endswith("-r1.jsonl")
+        assert json.loads(good.read_text())["generation_id"] == "b"
+
+    def test_existing_permissive_paths_are_tightened(self, ledger_dir):
+        led = UsageLedger()
+        month_dir = ledger_dir / "2026-11"
+        month_dir.mkdir(parents=True, mode=0o755)
+        os.chmod(ledger_dir, 0o755)
+        target = month_dir / led._file_name()
+        target.write_text("")
+        os.chmod(target, 0o644)
+        ts = datetime(2026, 11, 24, tzinfo=timezone.utc).timestamp()
+        assert led.record_call(api_key="k", model="m", ts_start=ts, ts_end=ts, usage={}) == target
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert stat.S_IMODE(month_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(ledger_dir.stat().st_mode) == 0o700
+
+    def test_symlinked_month_dir_or_file_is_refused(self, ledger_dir, tmp_path):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        ledger_dir.mkdir()
+        (ledger_dir / "2026-11").symlink_to(elsewhere)
+        led = UsageLedger()
+        ts = datetime(2026, 11, 24, tzinfo=timezone.utc).timestamp()
+        assert led.record_call(api_key="k", model="m", ts_start=ts, ts_end=ts, usage={}) is None
+        (ledger_dir / "2026-10").mkdir()
+        (ledger_dir / "2026-10" / led._file_name()).symlink_to(elsewhere / "victim")
+        ts = datetime(2026, 10, 24, tzinfo=timezone.utc).timestamp()
+        assert led.record_call(api_key="k", model="m", ts_start=ts, ts_end=ts, usage={}) is None
+        assert not list(elsewhere.iterdir())
 
     def test_month_dir_follows_ts_end(self, ledger_dir):
         led = UsageLedger()
