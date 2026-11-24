@@ -23,6 +23,9 @@ parent_dir = Path(__file__).resolve().parent.parent
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
+# Never let tests append to the real usage ledger (~/.pal/usage).
+os.environ["PAL_USAGE_LEDGER_DIR"] = tempfile.mkdtemp(prefix="pal-usage-ledger-tests-")
+
 import utils.env as env_config  # noqa: E402
 
 # Ensure tests operate with runtime environment rather than .env overrides during imports

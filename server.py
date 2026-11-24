@@ -689,8 +689,31 @@ async def handle_list_tools() -> list[Tool]:
     return tools
 
 
+def _usage_ledger_client() -> str:
+    """Classify the connected MCP client for the usage ledger (never raises)."""
+    try:
+        from utils.client_info import get_client_info_from_context
+        from utils.usage_ledger import classify_client
+
+        info = get_client_info_from_context(server) or {}
+        return classify_client(info.get("name"))
+    except Exception:
+        return "unknown"
+
+
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """MCP call_tool entry point; tags provider calls with tool/client for the usage ledger."""
+    from utils.usage_ledger import reset_call_context, set_call_context
+
+    tokens = set_call_context(name, _usage_ledger_client())
+    try:
+        return await _handle_call_tool(name, arguments)
+    finally:
+        reset_call_context(tokens)
+
+
+async def _handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """
     Handle incoming tool execution requests from MCP clients.
 
