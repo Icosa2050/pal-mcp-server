@@ -3,13 +3,15 @@
 import copy
 import ipaddress
 import logging
-from typing import Optional
+import time
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from openai import OpenAI
 
 from utils.env import get_env, suppress_env_vars
 from utils.image_utils import validate_image
+from utils.usage_ledger import extract_usage_fields, get_ledger
 
 from .base import ModelProvider
 from .shared import (
@@ -30,6 +32,8 @@ class OpenAICompatibleProvider(ModelProvider):
 
     DEFAULT_HEADERS = {}
     FRIENDLY_NAME = "OpenAI Compatible"
+    # Write billed calls to the local usage ledger (utils/usage_ledger.py).
+    USAGE_LEDGER_ENABLED = False
 
     def __init__(self, api_key: str, base_url: str = None, **kwargs):
         """Initialize the provider with API key and optional base URL.
@@ -453,7 +457,13 @@ class OpenAICompatibleProvider(ModelProvider):
                 f"o3-pro API request (sanitized): {json.dumps(sanitized_params, indent=2, ensure_ascii=False)}"
             )
 
-            response = self.client.responses.create(**completion_params)
+            ts_start = time.time()
+            try:
+                response = self.client.responses.create(**completion_params)
+            except Exception as exc:
+                self._record_usage_ledger(model_name=model_name, ts_start=ts_start, error=exc)
+                raise
+            self._record_usage_ledger(model_name=model_name, ts_start=ts_start, response=response)
 
             content = self._safe_extract_output_text(response)
 
@@ -638,7 +648,13 @@ class OpenAICompatibleProvider(ModelProvider):
 
         def _attempt() -> ModelResponse:
             attempt_counter["value"] += 1
-            response = self.client.chat.completions.create(**completion_params)
+            ts_start = time.time()
+            try:
+                response = self.client.chat.completions.create(**completion_params)
+            except Exception as exc:
+                self._record_usage_ledger(model_name=resolved_model, ts_start=ts_start, error=exc)
+                raise
+            self._record_usage_ledger(model_name=resolved_model, ts_start=ts_start, response=response)
 
             content = response.choices[0].message.content
             usage = self._extract_usage(response)
@@ -700,8 +716,14 @@ class OpenAICompatibleProvider(ModelProvider):
             # Log warning but don't fail
             logging.warning(f"Parameter validation limited for {model_name}: {e}")
 
-    def _extract_usage(self, response) -> dict[str, int]:
-        """Extract token usage from OpenAI response.
+    def _extract_usage(self, response) -> dict[str, Any]:
+        """Extract token usage from an OpenAI-compatible response.
+
+        Always returns ``input_tokens``/``output_tokens``/``total_tokens`` when
+        the response carries usage. When reported, also returns
+        ``cached_tokens``, ``reasoning_tokens``, ``cost_usd`` (OpenRouter usage
+        accounting, USD) and ``is_byok``. Works for both Chat Completions and
+        the Responses API usage shapes.
 
         Args:
             response: OpenAI API response object
@@ -709,15 +731,93 @@ class OpenAICompatibleProvider(ModelProvider):
         Returns:
             Dictionary with usage statistics
         """
-        usage = {}
+        usage: dict[str, Any] = {}
 
         if hasattr(response, "usage") and response.usage:
-            # Safely extract token counts with None handling
-            usage["input_tokens"] = getattr(response.usage, "prompt_tokens", 0) or 0
-            usage["output_tokens"] = getattr(response.usage, "completion_tokens", 0) or 0
-            usage["total_tokens"] = getattr(response.usage, "total_tokens", 0) or 0
+            fields = extract_usage_fields(response.usage)
+            usage["input_tokens"] = fields.get("prompt_tokens") or 0
+            usage["output_tokens"] = fields.get("completion_tokens") or 0
+            usage["total_tokens"] = fields.get("total_tokens") or 0
+            for key in ("cached_tokens", "reasoning_tokens", "cost_usd", "is_byok"):
+                if fields.get(key) is not None:
+                    usage[key] = fields[key]
 
         return usage
+
+    @staticmethod
+    def _billed_error_envelope(error: BaseException) -> Optional[dict]:
+        """Return the error JSON envelope if it reports usage (the call was billed).
+
+        The OpenAI SDK replaces ``APIStatusError.body`` with the nested
+        ``error`` object, dropping sibling ``usage``/``id`` fields, so prefer
+        the raw HTTP response JSON and fall back to ``body``. Only ``usage`` and
+        ``id`` are ever read from it; error messages are never logged.
+        """
+        candidates = []
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                candidates.append(response.json())
+            except Exception:
+                pass
+        candidates.append(getattr(error, "body", None))
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                if isinstance(candidate.get("usage"), dict):
+                    return candidate
+                nested = candidate.get("error")
+                if isinstance(nested, dict) and isinstance(nested.get("usage"), dict):
+                    return nested
+        return None
+
+    def _record_usage_ledger(
+        self,
+        *,
+        model_name: str,
+        ts_start: float,
+        response: Any = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Append one usage-ledger line for a billed provider call (fail-soft).
+
+        Only providers with ``USAGE_LEDGER_ENABLED`` (OpenRouter) write. Error
+        responses are recorded only when the error body carries usage (i.e. the
+        provider billed the call). Never raises.
+        """
+        if not self.USAGE_LEDGER_ENABLED:
+            return
+        try:
+            ts_end = time.time()
+            if response is not None:
+                usage = getattr(response, "usage", None)
+                if not usage:
+                    return
+                get_ledger().record_call(
+                    api_key=self.api_key,
+                    model=model_name,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    usage=usage,
+                    generation_id=getattr(response, "id", None),
+                    served_model=getattr(response, "model", None),
+                    status="ok",
+                )
+            elif error is not None:
+                body = self._billed_error_envelope(error)
+                if body is None:
+                    return
+                usage = body["usage"]
+                get_ledger().record_call(
+                    api_key=self.api_key,
+                    model=model_name,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    usage=usage,
+                    generation_id=body.get("id") if isinstance(body.get("id"), str) else None,
+                    status="error",
+                )
+        except Exception as exc:  # pragma: no cover - defensive, ledger must never break a call
+            logging.debug(f"Usage ledger hook skipped: {type(exc).__name__}")
 
     def count_tokens(self, text: str, model_name: str) -> int:
         """Count tokens using OpenAI-compatible tokenizer tables when available."""

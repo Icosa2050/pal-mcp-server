@@ -33,6 +33,9 @@ class OpenRouterProvider(OpenAICompatibleProvider):
 
     FRIENDLY_NAME = "OpenRouter"
 
+    # Record OpenRouter-reported usage and cost in the local usage ledger.
+    USAGE_LEDGER_ENABLED = True
+
     # Custom headers required by OpenRouter
     DEFAULT_HEADERS = {
         "HTTP-Referer": get_env("OPENROUTER_REFERER", "https://github.com/BeehiveInnovations/pal-mcp-server")

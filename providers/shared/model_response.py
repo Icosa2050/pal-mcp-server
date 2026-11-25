@@ -13,7 +13,8 @@ class ModelResponse:
     """Portable representation of a provider completion."""
 
     content: str
-    usage: dict[str, int] = field(default_factory=dict)
+    # Token counts (ints); providers may add cost_usd (float) and is_byok (bool).
+    usage: dict[str, Any] = field(default_factory=dict)
     model_name: str = ""
     friendly_name: str = ""
     provider: ProviderType = ProviderType.GOOGLE
