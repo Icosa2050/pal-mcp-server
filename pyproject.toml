@@ -89,19 +89,12 @@ ignore = [
     "B008",  # do not perform function calls in argument defaults
     "C901",  # too complex
     "B904",  # exception handling with raise from
-    "UP045",  # Defer widespread Optional annotation rewrites to a separate source cleanup.
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/*" = ["B011"]
 "tests/conftest.py" = ["E402"]  # Module level imports not at top of file - needed for test setup
-# Defer existing findings newly enabled by the Python 3.10 target; keep this change to the version floor.
-"clink/parsers/claude.py" = ["UP038"]
-"providers/base.py" = ["UP035"]
-"simulator_tests/log_utils.py" = ["UP007"]
-"tools/version.py" = ["B905"]
-"utils/usage_ledger.py" = ["UP038"]
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
