@@ -44,7 +44,7 @@ import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +57,11 @@ _DISABLED_VALUES = {"0", "false", "no", "off"}
 
 # Per-request context (set by the MCP call_tool handler). ContextVars are
 # task-local, so concurrent tool calls never see each other's values.
-_current_tool: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pal_usage_tool", default=None)
-_current_client: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pal_usage_client", default=None)
+_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar("pal_usage_tool", default=None)
+_current_client: contextvars.ContextVar[str | None] = contextvars.ContextVar("pal_usage_client", default=None)
 
 
-def set_call_context(tool: Optional[str], client: Optional[str]) -> tuple[contextvars.Token, contextvars.Token]:
+def set_call_context(tool: str | None, client: str | None) -> tuple[contextvars.Token, contextvars.Token]:
     """Record the tool name and client kind for provider calls in this context."""
 
     return _current_tool.set(tool), _current_client.set(client)
@@ -73,7 +73,7 @@ def reset_call_context(tokens: tuple[contextvars.Token, contextvars.Token]) -> N
     _current_client.reset(client_token)
 
 
-def classify_client(client_name: Optional[str]) -> str:
+def classify_client(client_name: str | None) -> str:
     """Map a raw MCP clientInfo name to ``claude`` / ``codex`` / ``unknown``."""
 
     if not client_name or not isinstance(client_name, str):
@@ -86,7 +86,7 @@ def classify_client(client_name: Optional[str]) -> str:
     return "unknown"
 
 
-def key_id_for(api_key: Optional[str]) -> Optional[str]:
+def key_id_for(api_key: str | None) -> str | None:
     """Return a non-reversible short identifier for an API key."""
 
     if not api_key or not isinstance(api_key, str):
@@ -115,7 +115,7 @@ def _field(obj: Any, name: str) -> Any:
     return value
 
 
-def _as_int(value: Any) -> Optional[int]:
+def _as_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -125,10 +125,10 @@ def _as_int(value: Any) -> Optional[int]:
     return None
 
 
-def _as_cost(value: Any) -> Optional[float]:
+def _as_cost(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         cost = float(value)
         return cost if cost >= 0 and cost == cost and cost != float("inf") else None
     if isinstance(value, str):
@@ -189,7 +189,7 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _clip(value: Any) -> Optional[str]:
+def _clip(value: Any) -> str | None:
     if value is None:
         return None
     text = value if isinstance(value, str) else str(value)
@@ -283,7 +283,7 @@ class UsageLedger:
             except OSError:
                 pass  # foreign files left in place; never delete what we don't own
 
-    def append(self, record: dict[str, Any], now: Optional[datetime] = None) -> Optional[Path]:
+    def append(self, record: dict[str, Any], now: datetime | None = None) -> Path | None:
         """Append one record. Returns the file path, or None if skipped/failed."""
 
         try:
@@ -328,15 +328,15 @@ class UsageLedger:
     def record_call(
         self,
         *,
-        api_key: Optional[str],
-        model: Optional[str],
+        api_key: str | None,
+        model: str | None,
         ts_start: float,
         ts_end: float,
         usage: Any,
-        generation_id: Optional[str] = None,
-        served_model: Optional[str] = None,
+        generation_id: str | None = None,
+        served_model: str | None = None,
         status: str = "ok",
-    ) -> Optional[Path]:
+    ) -> Path | None:
         """Build and append the ledger line for one provider call (fail-soft)."""
 
         try:
@@ -367,7 +367,7 @@ class UsageLedger:
             return None
 
 
-_ledger: Optional[UsageLedger] = None
+_ledger: UsageLedger | None = None
 _ledger_lock = threading.Lock()
 
 

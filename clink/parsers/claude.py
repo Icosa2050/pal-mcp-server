@@ -90,10 +90,10 @@ class ClaudeJSONParser(BaseParser):
             metadata["subtype"] = subtype_field
 
         duration_ms = payload.get("duration_ms")
-        if isinstance(duration_ms, (int, float)):
+        if isinstance(duration_ms, int | float):
             metadata["duration_ms"] = duration_ms
         api_duration = payload.get("duration_api_ms")
-        if isinstance(api_duration, (int, float)):
+        if isinstance(api_duration, int | float):
             metadata["duration_api_ms"] = api_duration
 
         usage = payload.get("usage")
